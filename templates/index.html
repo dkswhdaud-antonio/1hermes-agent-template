@@ -684,6 +684,15 @@
       <span>Setup</span>
     </div>
 
+    <div class="nav-group-label" style="margin-top:8px">Dashboard</div>
+    <div class="nav-item"
+         :class="{locked: !savedConfigComplete}"
+         @click="savedConfigComplete && (window.location.href='/')"
+         :title="savedConfigComplete ? 'Open the native Hermes dashboard' : 'Complete setup first'">
+      <span class="nav-icon">⬢</span>
+      <span>Hermes Dashboard</span>
+    </div>
+
     <div class="nav-group-label" style="margin-top:8px">Monitor</div>
     <div class="nav-item"
          :class="{active: page==='status', locked: !isSetupDone}"
@@ -915,10 +924,17 @@
         <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text-dim);cursor:pointer;">
           <input type="checkbox" x-model="restartOnSave"> Restart gateway after save
         </label>
-        <button class="btn primary" @click="saveConfig()" :disabled="saving">
-          <span x-show="!saving">Save &amp; Start</span>
-          <span x-show="saving">Saving…</span>
-        </button>
+        <div style="display:flex;gap:10px;align-items:center;">
+          <button class="btn" :disabled="!savedConfigComplete"
+                  @click="window.location.href='/'"
+                  :title="savedConfigComplete ? 'Open the native Hermes dashboard' : 'Save a provider + model first'">
+            Open Dashboard →
+          </button>
+          <button class="btn primary" @click="saveConfig()" :disabled="saving">
+            <span x-show="!saving">Save &amp; Start</span>
+            <span x-show="saving">Saving…</span>
+          </button>
+        </div>
       </div>
     </div>
 
@@ -1199,6 +1215,9 @@ function app() {
     approved: [],
     saving: false,
     restartOnSave: true,
+    // True only when the SERVER has a persisted complete config.
+    // Distinct from isSetupDone, which tracks the in-memory form.
+    savedConfigComplete: false,
 
     tools,
 
@@ -1262,7 +1281,7 @@ function app() {
 
     async loadConfig() {
       try {
-        const r = await fetch('/api/config');
+        const r = await fetch('/setup/api/config');
         if (r.ok) {
           const d = await r.json();
           this.vars = d.vars || {};
@@ -1284,6 +1303,11 @@ function app() {
           for (const t of this.tools) {
             this.toolsEnabled[t.key] = !!(this.vars[t.key]);
           }
+          // savedConfigComplete reflects the persisted server-side state.
+          // Masked secrets from the server still show truthy, so this
+          // mirrors the backend's is_config_complete() check.
+          const providerKeys = Object.values(this.providerMap).map(p => p.key);
+          this.savedConfigComplete = !!(this.vars.LLM_MODEL && providerKeys.some(k => this.vars[k]));
         }
       } catch {}
     },
@@ -1291,7 +1315,7 @@ function app() {
     async saveConfig() {
       this.saving = true;
       try {
-        const r = await fetch('/api/config', {
+        const r = await fetch('/setup/api/config', {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ vars: { ...this.vars }, _restart: this.restartOnSave }),
@@ -1304,7 +1328,7 @@ function app() {
 
     async resetConfig() {
       if (!confirm('Reset all configuration? This will stop the gateway and clear all saved settings.')) return;
-      const r = await fetch('/api/config/reset', { method: 'POST' });
+      const r = await fetch('/setup/api/config/reset', { method: 'POST' });
       if (r.ok) {
         await this.loadConfig();
         this.selectedProvider = '';
@@ -1317,14 +1341,14 @@ function app() {
 
     async loadStatus() {
       try {
-        const r = await fetch('/api/status');
+        const r = await fetch('/setup/api/status');
         if (r.ok) { const d = await r.json(); this.status = d; this.gw = d.gateway||{}; }
       } catch {}
     },
 
     async loadLogs() {
       try {
-        const r = await fetch('/api/logs');
+        const r = await fetch('/setup/api/logs');
         if (r.ok) {
           const d = await r.json();
           const box = this.$refs.logbox;
@@ -1337,28 +1361,28 @@ function app() {
 
     async loadPairing() {
       try {
-        const [pr, ar] = await Promise.all([fetch('/api/pairing/pending'), fetch('/api/pairing/approved')]);
+        const [pr, ar] = await Promise.all([fetch('/setup/api/pairing/pending'), fetch('/setup/api/pairing/approved')]);
         if (pr.ok) this.pending  = (await pr.json()).pending||[];
         if (ar.ok) this.approved = (await ar.json()).approved||[];
       } catch {}
     },
 
-    async startGw()        { await fetch('/api/gateway/start',   {method:'POST'}); this.notify('Starting…',   true); setTimeout(()=>this.loadStatus(),1000); },
-    async stopGw()         { await fetch('/api/gateway/stop',    {method:'POST'}); this.notify('Stopping…',   true); setTimeout(()=>this.loadStatus(),1000); },
-    async restartGateway() { await fetch('/api/gateway/restart', {method:'POST'}); this.notify('Restarting…', true); setTimeout(()=>this.loadStatus(),2000); },
+    async startGw()        { await fetch('/setup/api/gateway/start',   {method:'POST'}); this.notify('Starting…',   true); setTimeout(()=>this.loadStatus(),1000); },
+    async stopGw()         { await fetch('/setup/api/gateway/stop',    {method:'POST'}); this.notify('Stopping…',   true); setTimeout(()=>this.loadStatus(),1000); },
+    async restartGateway() { await fetch('/setup/api/gateway/restart', {method:'POST'}); this.notify('Restarting…', true); setTimeout(()=>this.loadStatus(),2000); },
 
     async approve(platform, code) {
-      const r = await fetch('/api/pairing/approve', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({platform,code}) });
+      const r = await fetch('/setup/api/pairing/approve', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({platform,code}) });
       if (r.ok) { this.notify('User approved', true); await this.loadPairing(); }
       else { const e = await r.json().catch(()=>{}); this.notify(e?.error||'Failed', false); }
     },
     async deny(platform, code) {
-      await fetch('/api/pairing/deny', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({platform,code}) });
+      await fetch('/setup/api/pairing/deny', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({platform,code}) });
       this.notify('Denied', true); await this.loadPairing();
     },
     async revoke(platform, user_id) {
       if (!confirm('Revoke access for this user?')) return;
-      await fetch('/api/pairing/revoke', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({platform,user_id}) });
+      await fetch('/setup/api/pairing/revoke', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({platform,user_id}) });
       this.notify('Revoked', true); await this.loadPairing();
     },
 

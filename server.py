@@ -1,8 +1,15 @@
 """
 Hermes Agent — Railway admin server.
 
-Serves an admin UI on $PORT, manages the Hermes gateway as a subprocess.
-The gateway is started automatically on boot if a provider API key is present.
+Responsibilities:
+  - Admin UI / setup wizard at /setup (Starlette + Jinja, protected by basic auth)
+  - Management API at /setup/api/* (config, status, logs, gateway, pairing)
+  - Reverse proxy at / and /* → native Hermes dashboard (hermes_cli/web_server, on 127.0.0.1:9119)
+  - Managed subprocesses: `hermes gateway` (agent) and `hermes dashboard` (native UI)
+
+First-visit behavior: if no provider+model config exists, GET / redirects to /setup.
+Once configured, / proxies to the Hermes dashboard. A small "← Setup" widget is
+injected into every proxied HTML response so users can always return to the wizard.
 """
 
 import asyncio
@@ -17,6 +24,7 @@ from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import httpx
 from starlette.applications import Starlette
 from starlette.authentication import (
     AuthCredentials,
@@ -27,7 +35,13 @@ from starlette.authentication import (
 from starlette.middleware import Middleware
 from starlette.middleware.authentication import AuthenticationMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, PlainTextResponse
+from starlette.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    Response,
+)
 from starlette.routing import Route
 from starlette.templating import Jinja2Templates
 
@@ -38,6 +52,19 @@ HERMES_HOME = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
 ENV_FILE = Path(HERMES_HOME) / ".env"
 PAIRING_DIR = Path(HERMES_HOME) / "pairing"
 PAIRING_TTL = 3600
+
+# Native Hermes dashboard — runs on loopback, fronted by our reverse proxy.
+HERMES_DASHBOARD_HOST = "127.0.0.1"
+HERMES_DASHBOARD_PORT = int(os.environ.get("HERMES_DASHBOARD_PORT", "9119"))
+HERMES_DASHBOARD_URL = f"http://{HERMES_DASHBOARD_HOST}:{HERMES_DASHBOARD_PORT}"
+
+# Hop-by-hop headers (RFC 7230 §6.1) plus `host` and `authorization`.
+# We strip these before forwarding: host is set by httpx, authorization is
+# our edge-only basic auth credential that must not leak to the subprocess.
+HOP_BY_HOP = {
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade", "host", "authorization",
+}
 
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
@@ -176,6 +203,18 @@ def write_env(path: Path, data: dict[str, str]) -> None:
     path.write_text("\n".join(lines))
 
 
+def is_config_complete(data: dict[str, str] | None = None) -> bool:
+    """Single source of truth for 'ready to run the gateway'.
+
+    Used by: GET / redirect, auto_start on boot, admin API status.
+    """
+    if data is None:
+        data = read_env(ENV_FILE)
+    has_model = bool(data.get("LLM_MODEL"))
+    has_provider = any(data.get(k) for k in PROVIDER_KEYS)
+    return has_model and has_provider
+
+
 def mask(data: dict[str, str]) -> dict[str, str]:
     return {
         k: (v[:8] + "***" if len(v) > 8 else "***") if k in SECRET_KEYS and v else v
@@ -292,6 +331,63 @@ class Gateway:
 
 gw = Gateway()
 cfg_lock = asyncio.Lock()
+
+
+# ── Hermes dashboard subprocess ───────────────────────────────────────────────
+class Dashboard:
+    """Manages the `hermes dashboard` subprocess (native Hermes web UI).
+
+    Bound to loopback only — we expose it to the public internet through our
+    reverse proxy on $PORT, where edge basic auth guards every request.
+    The dashboard is independent of the gateway: it reads config files
+    directly and tolerates a stopped gateway.
+    """
+
+    def __init__(self):
+        self.proc: asyncio.subprocess.Process | None = None
+
+    async def start(self):
+        if self.proc and self.proc.returncode is None:
+            return
+        try:
+            self.proc = await asyncio.create_subprocess_exec(
+                "hermes", "dashboard",
+                "--host", HERMES_DASHBOARD_HOST,
+                "--port", str(HERMES_DASHBOARD_PORT),
+                "--no-open",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            print(f"[dashboard] started on {HERMES_DASHBOARD_URL}", flush=True)
+        except Exception as e:
+            print(f"[dashboard] failed to start: {e}", flush=True)
+
+    async def stop(self):
+        if not self.proc or self.proc.returncode is not None:
+            return
+        self.proc.terminate()
+        try:
+            await asyncio.wait_for(self.proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            self.proc.kill()
+            await self.proc.wait()
+
+
+dash = Dashboard()
+
+# Shared async HTTP client for the reverse proxy. Created lazily so we pick up
+# the running event loop, torn down in lifespan.
+_http_client: httpx.AsyncClient | None = None
+
+
+def get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, connect=5.0),
+            follow_redirects=False,
+        )
+    return _http_client
 
 
 # ── Route handlers ────────────────────────────────────────────────────────────
@@ -474,38 +570,174 @@ async def api_pairing_revoke(request: Request):
     return JSONResponse({"ok": True})
 
 
+# ── Reverse proxy → Hermes dashboard ──────────────────────────────────────────
+BACK_TO_SETUP_WIDGET = (
+    '<div id="hermes-back-widget" style="position:fixed;top:14px;right:14px;'
+    'z-index:99999;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;'
+    'font-size:11px;">'
+    '<a href="/setup" style="background:rgba(20,24,31,0.92);backdrop-filter:blur(8px);'
+    'border:1px solid #252d3d;border-radius:6px;padding:6px 12px;color:#c9d1d9;'
+    'text-decoration:none;display:inline-flex;align-items:center;gap:6px;">← Setup</a>'
+    '</div>'
+)
+
+DASHBOARD_UNAVAILABLE_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>Dashboard starting…</title>
+<style>body{background:#0d0f14;color:#c9d1d9;font-family:ui-monospace,Menlo,monospace;
+display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.card{max-width:480px;padding:32px;border:1px solid #252d3d;border-radius:12px;
+background:#14181f;text-align:center}
+h1{font-size:16px;color:#d29922;margin:0 0 12px;font-weight:600}
+p{font-size:13px;color:#6b7688;line-height:1.6;margin:0 0 16px}
+a{color:#6272ff;text-decoration:none;border:1px solid #252d3d;border-radius:6px;
+padding:7px 14px;font-size:12px;display:inline-block}
+a:hover{border-color:#6272ff}</style></head>
+<body><div class="card">
+<h1>⚠ Hermes dashboard unavailable</h1>
+<p>The native Hermes dashboard is not responding on port %d.<br>
+It may still be starting up, or it may have crashed.</p>
+<p>Try refreshing in a few seconds, or head back to setup.</p>
+<a href="/setup">← Back to Setup</a>
+</div>
+<script>setTimeout(()=>location.reload(),4000);</script>
+</body></html>""" % HERMES_DASHBOARD_PORT
+
+
+async def _proxy_to_dashboard(request: Request) -> Response:
+    """Forward an authenticated request to the Hermes dashboard subprocess.
+
+    Assumes edge auth (basic auth middleware) has already validated the caller.
+    HTTP-only: the native Hermes dashboard does not use WebSockets.
+    """
+    client = get_http_client()
+    target = f"{HERMES_DASHBOARD_URL}{request.url.path}"
+    if request.url.query:
+        target = f"{target}?{request.url.query}"
+
+    req_headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in HOP_BY_HOP
+    }
+    body = await request.body()
+
+    try:
+        upstream = await client.request(
+            request.method,
+            target,
+            headers=req_headers,
+            content=body,
+        )
+    except (httpx.ConnectError, httpx.ConnectTimeout):
+        return HTMLResponse(DASHBOARD_UNAVAILABLE_HTML, status_code=503)
+    except httpx.RequestError as e:
+        print(f"[proxy] upstream error for {request.method} {request.url.path}: {e}", flush=True)
+        return HTMLResponse(DASHBOARD_UNAVAILABLE_HTML, status_code=502)
+
+    # Strip hop-by-hop and length/encoding headers — Starlette recomputes them.
+    resp_headers = {
+        k: v for k, v in upstream.headers.items()
+        if k.lower() not in HOP_BY_HOP
+        and k.lower() not in ("content-encoding", "content-length")
+    }
+
+    content = upstream.content
+    content_type = upstream.headers.get("content-type", "").lower()
+
+    # Inject the "← Setup" widget into HTML pages so users can always return.
+    if "text/html" in content_type and b"</body>" in content:
+        try:
+            text = content.decode("utf-8", errors="replace")
+            text = text.replace("</body>", BACK_TO_SETUP_WIDGET + "</body>", 1)
+            content = text.encode("utf-8")
+        except Exception:
+            pass  # on any error, fall back to raw upstream content
+
+    return Response(
+        content=content,
+        status_code=upstream.status_code,
+        headers=resp_headers,
+    )
+
+
+async def route_root(request: Request) -> Response:
+    """GET /: redirect to /setup if not configured, else proxy to the dashboard."""
+    if err := guard(request): return err
+    if request.method == "GET" and not is_config_complete():
+        return RedirectResponse("/setup", status_code=302)
+    return await _proxy_to_dashboard(request)
+
+
+async def route_proxy(request: Request) -> Response:
+    """Catch-all: forward any unmatched path to the Hermes dashboard."""
+    if err := guard(request): return err
+    return await _proxy_to_dashboard(request)
+
+
+async def route_setup_404(request: Request) -> Response:
+    """Typos under /setup/* should 404 here — not fall through to the proxy."""
+    if err := guard(request): return err
+    return PlainTextResponse("Not Found", status_code=404)
+
+
 # ── App lifecycle ─────────────────────────────────────────────────────────────
 async def auto_start():
-    data = read_env(ENV_FILE)
-    if any(data.get(k) for k in PROVIDER_KEYS):
+    if is_config_complete():
         asyncio.create_task(gw.start())
     else:
-        print("[server] No provider key found — gateway not started. Configure one in the admin UI.", flush=True)
+        print("[server] Config incomplete — gateway not started. Configure provider + model in the admin UI.", flush=True)
 
 
 @asynccontextmanager
 async def lifespan(app):
+    # Dashboard runs always — it's the user-facing UI after setup is done,
+    # and it's independent of gateway state.
+    asyncio.create_task(dash.start())
     await auto_start()
-    yield
-    await gw.stop()
+    try:
+        yield
+    finally:
+        await asyncio.gather(
+            gw.stop(),
+            dash.stop(),
+            return_exceptions=True,
+        )
+        global _http_client
+        if _http_client is not None:
+            await _http_client.aclose()
+            _http_client = None
 
+
+ANY_METHOD = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
 
 routes = [
-    Route("/",                          page_index),
-    Route("/health",                    route_health),
-    Route("/api/config",                api_config_get,      methods=["GET"]),
-    Route("/api/config",                api_config_put,      methods=["PUT"]),
-    Route("/api/status",                api_status),
-    Route("/api/logs",                  api_logs),
-    Route("/api/gateway/start",         api_gw_start,        methods=["POST"]),
-    Route("/api/gateway/stop",          api_gw_stop,         methods=["POST"]),
-    Route("/api/gateway/restart",       api_gw_restart,      methods=["POST"]),
-    Route("/api/config/reset",          api_config_reset,    methods=["POST"]),
-    Route("/api/pairing/pending",       api_pairing_pending),
-    Route("/api/pairing/approve",       api_pairing_approve, methods=["POST"]),
-    Route("/api/pairing/deny",          api_pairing_deny,    methods=["POST"]),
-    Route("/api/pairing/approved",      api_pairing_approved),
-    Route("/api/pairing/revoke",        api_pairing_revoke,  methods=["POST"]),
+    # Unauthenticated — Railway healthcheck.
+    Route("/health",                            route_health),
+
+    # Our setup wizard + management API, all under /setup/* (basic-auth guarded).
+    Route("/setup",                             page_index),
+    Route("/setup/",                            page_index),
+    Route("/setup/api/config",                  api_config_get,      methods=["GET"]),
+    Route("/setup/api/config",                  api_config_put,      methods=["PUT"]),
+    Route("/setup/api/status",                  api_status),
+    Route("/setup/api/logs",                    api_logs),
+    Route("/setup/api/gateway/start",           api_gw_start,        methods=["POST"]),
+    Route("/setup/api/gateway/stop",            api_gw_stop,         methods=["POST"]),
+    Route("/setup/api/gateway/restart",         api_gw_restart,      methods=["POST"]),
+    Route("/setup/api/config/reset",            api_config_reset,    methods=["POST"]),
+    Route("/setup/api/pairing/pending",         api_pairing_pending),
+    Route("/setup/api/pairing/approve",         api_pairing_approve, methods=["POST"]),
+    Route("/setup/api/pairing/deny",            api_pairing_deny,    methods=["POST"]),
+    Route("/setup/api/pairing/approved",        api_pairing_approved),
+    Route("/setup/api/pairing/revoke",          api_pairing_revoke,  methods=["POST"]),
+
+    # /setup/* typos return a real 404 — not a silent proxy fallthrough.
+    Route("/setup/{path:path}",                 route_setup_404,     methods=ANY_METHOD),
+
+    # Root: redirect to /setup if unconfigured, otherwise proxy the dashboard.
+    Route("/",                                  route_root,          methods=ANY_METHOD),
+
+    # Catch-all: everything else proxies to the Hermes dashboard subprocess.
+    Route("/{path:path}",                       route_proxy,         methods=ANY_METHOD),
 ]
 
 app = Starlette(
@@ -524,6 +756,7 @@ if __name__ == "__main__":
 
     def _shutdown():
         loop.create_task(gw.stop())
+        loop.create_task(dash.stop())
         server.should_exit = True
 
     for sig in (signal.SIGTERM, signal.SIGINT):
