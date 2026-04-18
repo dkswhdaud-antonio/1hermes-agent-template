@@ -847,13 +847,20 @@ async def _proxy_to_dashboard(request: Request) -> Response:
 
 
 async def route_root(request: Request) -> Response:
-    """GET /: proxy to the dashboard.
+    """GET /: first-visit smart redirect, otherwise proxy to the dashboard.
 
-    The dashboard is always reachable — Hermes ships with a lot of config
-    surface area (Keys tab, skills, toolsets, analytics, etc.) that's useful
-    even before a provider+model is saved via our setup wizard.
+    - Unconfigured + bare GET `/` → bounce to `/setup` so new users land on
+      the wizard instead of a half-empty dashboard.
+    - Sidebar / in-app links pass `?force=1` to opt out of that redirect —
+      users who explicitly want the dashboard (e.g. to set providers via
+      the Keys tab) can still reach it without saving config first.
+    - Non-GET (SPA API calls, etc.) always proxy through.
     """
     if err := guard(request): return err
+    if (request.method == "GET"
+            and request.query_params.get("force") != "1"
+            and not is_config_complete()):
+        return RedirectResponse("/setup", status_code=302)
     return await _proxy_to_dashboard(request)
 
 
